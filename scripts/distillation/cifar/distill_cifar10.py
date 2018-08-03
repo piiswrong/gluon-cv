@@ -48,6 +48,8 @@ parser.add_argument('--temperature', type=float, default=20,
                     help='Temperature of teacher softmax.')
 parser.add_argument('--hard-weight', type=float, default=0.5,
                     help='Weight of hard loss.')
+parser.add_argument('--mixup', type=float, default=0,
+                    help='Alpha value for mixup training')
 parser.add_argument('--mode', type=str,
                     help='mode in which to train the model. options are imperative, hybrid')
 parser.add_argument('--save-period', type=int, default=10,
@@ -85,6 +87,7 @@ else:
 net = get_model(model_name, **kwargs)
 if opt.resume_from:
     net.load_params(opt.resume_from, ctx = context)
+net.initialize(mx.init.Xavier(), ctx=context)
 
 # Teacher
 teacher_name = opt.teacher
@@ -94,7 +97,8 @@ if teacher_name.startswith('cifar_wideresnet'):
 else:
     kwargs = {'classes': classes}
 teacher = get_model(teacher_name, pretrained=True, **kwargs)
-
+# teacher.load_parameters('0.9592-cifar-cifar_wideresnet40_8-131-best.params')
+teacher.collect_params().reset_ctx(ctx=context)
 
 # Optimizer
 optimizer = 'nag'
@@ -117,28 +121,61 @@ transform_test = transforms.Compose([
     transforms.Normalize([0.4914, 0.4822, 0.4465], [0.2023, 0.1994, 0.2010])
 ])
 
-def test(ctx, val_data):
+train_data = gluon.data.DataLoader(
+    gluon.data.vision.CIFAR10(train=True).transform_first(transform_train),
+    batch_size=batch_size, shuffle=True, last_batch='discard', num_workers=num_workers)
+
+val_data = gluon.data.DataLoader(
+    gluon.data.vision.CIFAR10(train=False).transform_first(transform_test),
+    batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+
+# Loss
+class DistillationLoss(gluon.HybridBlock):
+    def __init__(self, temperature, hard_weight, sparse_label=True, **kwargs):
+        super(DistillationLoss, self).__init__(**kwargs)
+        self._temperature = temperature
+        self._hard_weight = hard_weight
+        with self.name_scope():
+            self.soft_loss = gluon.loss.SoftmaxCrossEntropyLoss(sparse_label=False)
+            self.hard_loss = gluon.loss.SoftmaxCrossEntropyLoss(sparse_label=sparse_label)
+
+    def hybrid_forward(self, F, output, label, soft_target):
+        if self._hard_weight == 0:
+            return (self._temperature**2)*self.soft_loss(output/self._temperature, soft_target)
+        elif self._hard_weight == 1:
+            return self.hard_loss(output, label)
+        else:
+            return (1-self._hard_weight)*(self._temperature**2)*self.soft_loss(output/self._temperature, soft_target) + self._hard_weight*self.hard_loss(output, label)
+
+loss_fn = DistillationLoss(temperature, hard_weight, sparse_label=(opt.mixup == 0))
+
+def mixup_data(data, label, alpha):
+    label = label.one_hot(classes)
+
+    length = data.shape[0]
+    idx = np.random.permutation(length)
+    lam = mx.nd.array(np.random.beta(alpha, alpha, length))
+
+    lam = lam.reshape((length,) + (1,) * (len(data.shape) - 1))
+    data = lam * data + (1-lam) * data[idx]
+    lam = lam.reshape((length,) + (1,) * (len(label.shape) - 1))
+    label = lam * label + (1-lam) * label[idx]
+
+    return data, label
+
+def test(ctx, model, val_data):
     metric = mx.metric.Accuracy()
     for i, batch in enumerate(val_data):
         data = gluon.utils.split_and_load(batch[0], ctx_list=ctx, batch_axis=0)
         label = gluon.utils.split_and_load(batch[1], ctx_list=ctx, batch_axis=0)
-        outputs = [net(X) for X in data]
+        outputs = [model(X) for X in data]
         metric.update(label, outputs)
     return metric.get()
 
 def train(epochs, ctx):
     if isinstance(ctx, mx.Context):
         ctx = [ctx]
-    net.initialize(mx.init.Xavier(), ctx=ctx)
-    teacher.collect_params().reset_ctx(ctx=ctx)
-
-    train_data = gluon.data.DataLoader(
-        gluon.data.vision.CIFAR10(train=True).transform_first(transform_train),
-        batch_size=batch_size, shuffle=True, last_batch='discard', num_workers=num_workers)
-
-    val_data = gluon.data.DataLoader(
-        gluon.data.vision.CIFAR10(train=False).transform_first(transform_test),
-        batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     trainer = gluon.Trainer(net.collect_params(), optimizer,
                             {'learning_rate': opt.lr, 'wd': opt.wd, 'momentum': opt.momentum})
@@ -165,15 +202,17 @@ def train(epochs, ctx):
             trainer.set_learning_rate(trainer.learning_rate*lr_decay)
             lr_decay_count += 1
 
-        for i, batch in enumerate(train_data):
-            data = gluon.utils.split_and_load(batch[0], ctx_list=ctx, batch_axis=0)
-            label = gluon.utils.split_and_load(batch[1], ctx_list=ctx, batch_axis=0)
+        for i, (data, label) in enumerate(train_data):
+            if opt.mixup > 0:
+                data, label = mixup_data(data, label, opt.mixup)
+            data = gluon.utils.split_and_load(data, ctx_list=ctx, batch_axis=0)
+            label = gluon.utils.split_and_load(label, ctx_list=ctx, batch_axis=0)
 
             prob = [nd.softmax(teacher(X)/temperature) for X in data]
 
             with ag.record():
                 output = [net(X) for X in data]
-                loss = [(1-hard_weight)*temperature*temperature*soft_loss(yhat/temperature, p) + hard_weight*hard_loss(yhat, l) for yhat, p, l in zip(output, prob, label)]
+                loss = [loss_fn(yhat, l, p) for yhat, p, l in zip(output, prob, label)]
             for l in loss:
                 l.backward()
             trainer.step(batch_size)
@@ -185,17 +224,15 @@ def train(epochs, ctx):
 
         train_loss /= batch_size * num_batch
         name, acc = train_metric.get()
-        name, val_acc = test(ctx, val_data)
+        name, val_acc = test(ctx, net, val_data)
         train_history.update([1-acc, 1-val_acc])
         train_history.plot(save_path='%s/%s_history.png'%(save_dir, model_name))
+        logging.info('[Epoch %d] train=%f val=%f loss=%f time: %f' %
+            (epoch, acc, val_acc, train_loss, time.time()-tic))
 
         if val_acc > best_val_score:
             best_val_score = val_acc
             net.save_parameters('%s/%.4f-cifar-%s-%d-best.params'%(save_dir, best_val_score, model_name, epoch))
-
-        name, val_acc = test(ctx, val_data)
-        logging.info('[Epoch %d] train=%f val=%f loss=%f time: %f' %
-            (epoch, acc, val_acc, train_loss, time.time()-tic))
 
         if save_period and save_dir and (epoch + 1) % save_period == 0:
             net.save_parameters('%s/cifar10-%s-%d.params'%(save_dir, model_name, epoch))
@@ -206,6 +243,10 @@ def train(epochs, ctx):
 def main():
     if opt.mode == 'hybrid':
         net.hybridize(static_alloc=True, static_shape=True)
+        teacher.hybridize(static_alloc=True, static_shape=True)
+        loss_fn.hybridize(static_alloc=True, static_shape=True)
+
+    logging.info('Teacher accuracy: %s: %f'%test(context, teacher, val_data))
     train(opt.num_epochs, context)
 
 if __name__ == '__main__':

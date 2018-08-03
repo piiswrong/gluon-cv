@@ -1,5 +1,6 @@
 import argparse, time, logging, os, datetime
 
+import numpy as np
 import mxnet as mx
 from mxnet import gluon, nd
 from mxnet import autograd as ag
@@ -61,10 +62,18 @@ parser.add_argument('--hard-weight', type=float, default=0.5,
                     help='Weight of hard loss.')
 parser.add_argument('--mixup', type=float, default=0,
                     help='Alpha value for mixup training')
+parser.add_argument('--alpha-mode', type=str, default='step',
+                    help='mixup alpha scheduler mode. options are step, poly and cosine.')
+parser.add_argument('--alpha-decay', type=float, default=0.1,
+                    help='decay rate of mixup alpha. default is 0.1.')
+parser.add_argument('--alpha-decay-period', type=int, default=0,
+                    help='interval for periodic mixup alpha decays. default is 0 to disable.')
+parser.add_argument('--alpha-decay-epoch', type=str, default='40,60',
+                    help='epoches at which mixup alpha decays. default is 40,60.')
 parser.add_argument('--mode', type=str,
                     help='mode in which to train the model. options are symbolic, imperative, hybrid')
-parser.add_argument('--teacher', type=str, default='resnet',
-help='teacher model to distill from')
+parser.add_argument('--teacher', type=str, default=None,
+                    help='teacher model to distill from')
 parser.add_argument('--model', type=str, required=True,
                     help='type of model to use. see vision_model for options.')
 parser.add_argument('--use-pretrained', action='store_true',
@@ -124,21 +133,33 @@ optimizer_params = {'wd': opt.wd, 'momentum': opt.momentum, 'lr_scheduler': lr_s
 if opt.dtype != 'float32':
     optimizer_params['multi_precision'] = True
 
+# Mixup alpha
+# alpha_decay_period = opt.alpha_decay_period
+# if opt.alpha_decay_period > 0:
+#     alpha_decay_epoch = list(range(alpha_decay_period, opt.num_epochs, alpha_decay_period))
+# else:
+#     alpha_decay_epoch = [int(i) for i in opt.alpha_decay_epoch.split(',')]
+# alpha_scheduler = LRScheduler(mode=opt.alpha_mode, baselr=opt.mixup,
+#                               niters=num_batches, nepochs=opt.num_epochs,
+#                               step=alpha_decay_epoch, step_factor=opt.alpha_decay, power=2)
+
 
 # Teacher
-teacher_name = opt.teacher
+if opt.hard_weight < 1.0:
+    teacher_name = opt.teacher
 
-kwargs = {'ctx': context, 'pretrained': True, 'classes': classes}
-if teacher_name.startswith('vgg'):
-    kwargs['batch_norm'] = opt.batch_norm
-elif teacher_name.startswith('resnext'):
-    kwargs['use_se'] = opt.use_se
+    kwargs = {'ctx': context, 'pretrained': True, 'classes': classes}
+    if teacher_name.startswith('vgg'):
+        kwargs['batch_norm'] = opt.batch_norm
+    elif teacher_name.startswith('resnext'):
+        kwargs['use_se'] = opt.use_se
 
-if opt.last_gamma:
-    kwargs['last_gamma'] = True
+    if opt.last_gamma:
+        kwargs['last_gamma'] = True
 
-teacher = get_model(teacher_name, **kwargs)
-teacher.cast(opt.dtype)
+    teacher = get_model(teacher_name, **kwargs)
+    teacher.load_parameters('0.19691-0.04761-resnet101_v1c_mixup.params')
+    teacher.cast(opt.dtype)
 
 
 # Model
@@ -260,9 +281,6 @@ else:
 
 
 # Loss
-
-
-# Loss
 class DistillationLoss(gluon.HybridBlock):
     def __init__(self, temperature, hard_weight, sparse_label=True, **kwargs):
         super(DistillationLoss, self).__init__(**kwargs)
@@ -287,7 +305,7 @@ def mixup_data(data, label, alpha):
 
     length = data.shape[0]
     idx = np.random.permutation(length)
-    lam = mx.nd.array(np.random.beta(alpha, alpha, length))
+    lam = mx.nd.array(np.random.beta(alpha, alpha, length), ctx=data.context)
 
     lam = lam.reshape((length,) + (1,) * (len(data.shape) - 1))
     data = lam * data + (1-lam) * data[idx]
@@ -330,11 +348,18 @@ def train(ctx):
 
         for i, batch in enumerate(train_data):
             data, label = batch_fn(batch, ctx)
+            if opt.mixup > 0:
+                # alpha_scheduler.update(i, epoch)
+                alpha = opt.mixup # alpha_scheduler(0)
+                data, label = zip(*(mixup_data(x, y, alpha) for x, y in zip(data, label)))
 
-            prob = [nd.softmax(teacher(X)/opt.temperature) for X in data]
+            if opt.hard_weight < 1.0:
+                prob = [nd.softmax(teacher(X)/opt.temperature) for X in data]
 
             with ag.record():
                 outputs = [net(X.astype(opt.dtype, copy=False)) for X in data]
+                if opt.hard_weight == 1:
+                    prob = outputs
                 loss = [loss_fn(yhat, l, p) for yhat, p, l in zip(outputs, prob, label)]
             for l in loss:
                 l.backward()
@@ -345,9 +370,9 @@ def train(ctx):
             if opt.log_interval and not (i+1)%opt.log_interval:
                 _, top1 = acc_top1.get()
                 err_top1 = 1-top1
-                logging.info('Epoch[%d] Batch [%d]\tSpeed: %f samples/sec\ttop1-err=%f\tlr=%f'%(
+                logging.info('Epoch[%d] Batch [%d]\tSpeed: %f samples/sec\ttop1-err=%f\tlr=%f\talpha=%f'%(
                              epoch, i, batch_size*opt.log_interval/(time.time()-btic), err_top1,
-                             trainer.learning_rate))
+                             trainer.learning_rate, alpha))
                 btic = time.time()
 
         _, top1 = acc_top1.get()
@@ -373,10 +398,11 @@ def train(ctx):
 def main():
     if opt.mode == 'hybrid':
         net.hybridize(static_alloc=True, static_shape=True)
-        teacher.hybridize(static_alloc=True, static_shape=True)
         loss_fn.hybridize(static_alloc=True, static_shape=True)
-    err_top1_val, err_top5_val = test(teacher, context, val_data)
-    logging.info('Teacher: err-top1=%f err-top5=%f'%(err_top1_val, err_top5_val))
+        if opt.hard_weight < 1.0:
+            teacher.hybridize(static_alloc=True, static_shape=True)
+            err_top1_val, err_top5_val = test(teacher, context, val_data)
+            logging.info('Teacher: err-top1=%f err-top5=%f'%(err_top1_val, err_top5_val))
     train(context)
 
 if __name__ == '__main__':
