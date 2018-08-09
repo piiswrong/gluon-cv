@@ -158,7 +158,7 @@ if opt.hard_weight < 1.0:
         kwargs['last_gamma'] = True
 
     teacher = get_model(teacher_name, **kwargs)
-    teacher.load_parameters('0.19691-0.04761-resnet101_v1c_mixup.params')
+    teacher.load_parameters('0.18909-0.0446-resnet152_v1c-mixup.params')
     teacher.cast(opt.dtype)
 
 

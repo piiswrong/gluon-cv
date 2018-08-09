@@ -9,5 +9,5 @@ python distill_imagenet.py \
   --num-epochs 200 --batch-size 64 --num-gpus 8 -j 60 \
   --warmup-epochs 5 --use-rec --last-gamma \
   --hard-weight=0.5 --temperature=20 --mixup=0.2 \
-  --teacher=resnet101_v1c \
+  --teacher=resnet152_v1c \
   $@
